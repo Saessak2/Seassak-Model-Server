@@ -2,21 +2,44 @@ from rest_framework import viewsets, status
 from rest_framework.views import APIView  
 from rest_framework.response import Response
 from rest_framework.decorators import api_view
-from elasticsearch import Elasticsearch , helpers
-import re
+from elasticsearch import Elasticsearch
 import time
-from embedder import Embedder
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-from hanspell import spell_checker
-from konlpy.tag import Komoran
 from crawler2 import Crawler
 import logging
+import bm25
+import preprocessor
+import datetime
+
 
 es = Elasticsearch([{'host':'localhost','port':'9200'}])
-
+dt_now = datetime.datetime.now()
 
 # 검색 field에 (^) notation을 추가하면 해당 field 검색이 boost(relevance score 계산시 우대를 받게 됨)를 얻게 됩니다. notation이 있을 때와 없을 때 score를 비교해보면 바로 알수 있을것입니다
+
+
+def search_auto_comment(id):
+    response = es.search(
+                index = 'kinnaver',
+                body={
+                    "query": {
+                        "term": {
+                            "_id": id
+                        }
+                    },
+                    "_source": [
+                        "link", "title", "knid"
+                    ]
+                }
+            )
+
+    hit = response['hits']['hits'][0]
+    response = {
+        'knid': hit.get('_source')['knid'],
+        'title': hit.get('_source')['title'],
+        'link': hit.get('_source')['link']
+    }
+    return response
+
 
 # 자동 답변 
 # qa/comment/auto
@@ -29,154 +52,75 @@ class AutoCommentAPI(APIView):
     logger.addHandler(stream_handler)
 
     INDEX_NAME = 'kinnaver'
-
-    before_request = ''
+    
+    flag = 0
+    print('flag => ', flag)
 
     def post(self, request):
-        print("#################################### connnected #######################################")  
         
-        # client_ip = get_client_ip(request)
+        if self.flag == 1:
+            print("한번만 해라...")
+            return Response() 
+
+        self.flag = 1
+        print("#################################### connnected #######################################")  
 
         self.logger.info(get_client_ip(request))
+
+        # now = dt_now.strftime('%Y-%m-%d %H:%M:%S')
+        # if self.request_time == now:
+        #     return Response(status=status.HTTP_200_OK)
+        # self.request_time = now
+
+        # print(now)
+
+        search_start = time.time()
 
         request_data = request.data
         question = request_data['question']
         category = request_data['category']
-        print("query => " + question +", category => "+category)
+        print("question => " + question +", category => "+category)
 
         # TODO  개체명 인식 -> 태그 꺼내기 {'PLT': [], 'CTG': [], 'BUG' : [], 'DIS' : []}
 
-        es = Elasticsearch([{'host':'localhost','port':'9200'}])
+        ####################### 질문 전처리 및 임베딩 #########################
 
-        ####################### 질문 임베딩 #########################
-        user_matrix = np.array([embedding(remove_stopword(question))])
-
-        search_start = time.time()
-
-        # TODO : 모든 vector랑 조회하지 말고 그 전에 거르기 <- 모든 vector 조회하니까 시간 너무 오래걸림
-        # TODO : 위에 태그 꺼낸걸로 elastic 검색해서 스코어 높은거 size 100개? 정도 꺼내기
-        ################ 모든 sentence_vector 조회 XxXXX ################
-        # try :
-        response = es.search(
-            index = self.INDEX_NAME,
-            body= {
-                "track_total_hits": True,
-                "_source": [
-                    "sentence_vector", "knid"
-                ],
-                "query": {"match_all": {}},
-                "size": 10000,
-                "sort": [{
-                    "knid": {"order": "asc"}
-                }]
-            }
-        )
-
-        search_time = "총 시간 => " + str(time.time() - search_start)
-
-        cnt = str(response['hits']['total']['value'])
-        print("search 개수 -> " + cnt)
-
-        sources = []
-        matrix = []
-        for data in response['hits']['hits']:
-            source = {}
-            source['knid'] = data.get('_source')['knid']
-            source['sentence_vector'] = data.get('_source')['sentence_vector']
-            matrix.append(source['sentence_vector'])
-            sources.append(source)
-        matrix = np.array(matrix)
+        # 불용어 제거 & 형태소 분석
+        removed = preprocessor.remove_stopwords([question])
+        analyzed = preprocessor.komoran_analyzer(removed)
         
-        ################## cosine similarity ###################
+        # doc_scores = bm25.get_scores(analyzed[0])
+        # print(doc_scores)
 
-        sim_list = get_similar_list(matrix, user_matrix)  # -> id 오름차순 
-        sim_list = sorted(sim_list, key=lambda x: x['score'], reverse=True) # 유사도 순 정렬
-        # sim_list = sim_list[:10]
-        # print(sim_list)
+        top_indexs = bm25.getTopN(analyzed[0], n=10)
+        print(top_indexs)
 
-        ################ 유사한거 뽑은 id로 조회 ##################
-        for item in sim_list:
-            print("start crawling >> id -> " + str(item['id'])) 
-            search_response = search_auto_comment(str(item['id']))  # knid, title, link 받아옴
+        ################ index로 문서 조회  ################
+
+        for index in top_indexs:
+            search_response = search_auto_comment(index)  # knid, title, link 받아옴
 
             ################### 댓글 크롤링 ######################
             answer = Crawler.get_answer(search_response['link'])
             if answer != None:
                 result = {
-                    # 'id': item['id'],
-                    'similarity': str(round(item['score'] * 100)) + "%",
                     # 'knid': search_response['knid'],
                     'title': search_response['title'],
                     'link': search_response['link'],
                     'answer': answer
-                    # 'sentence': search_response['sentence']
                 }
                 break # 댓글 있는거 찾으면 바로 완료
                 
-            
+        search_time = "총 시간 => " + str(time.time() - search_start)
         print(search_time)
 
+        self.flag = 0
         return Response([result], status=status.HTTP_200_OK)
 
-def search_auto_comment(id):
-    response = es.search(
-                index = 'kinnaver',
-                body={
-                    "query": {
-                        "term": {
-                            "_id": id
-                        }
-                    },
-                    "_source": [
-                        "link", "title", "knid", "sentence"
-                    ]
-                }
-            )
-
-    hit = response['hits']['hits'][0]
-    response = {
-        'knid': hit.get('_source')['knid'],
-        'title': hit.get('_source')['title'],
-        'link': hit.get('_source')['link'],
-        'sentence': hit.get('_source')['sentence']
-
-    }
-    return response
-
-def get_similar_list(matrix, user_matrix):
-    cosine_sim = cosine_similarity(matrix, user_matrix)
-    print('코사인 유사도 연산 결과 :',cosine_sim.shape)
-    
-
-    sim_list = [] 
-    cnt = -1
-    for x in cosine_sim:
-        cnt += 1 
-        item = {}
-        item['id'] = cnt
-        item['score'] = x[0]
-        sim_list.append(item)
-
-    return sim_list         
 
 
 
-def remove_stopword(text):
-    # 불용어 제거
-    text = re.sub(r"[^\uAC00-\uD7A30-9a-zA-Z.\s]",' ', text) # 한글음절, 영어, 숫자, 띄어쓰기 뺴고 다 제거
-    text = re.sub('[.]{2,}', '.', text) # 온점 2개 이상 1개로 대체
-    text = re.sub('[ ]{2,}', ' ', text) # 공백 2개 이상 1개로 대체
-    text = re.sub("[\t]",' ', text) 
-    return text
 
-
-def embedding(text):
-    # 임베딩
-    embedding_start = time.time()
-    text_vector = Embedder.embedder.encode(text, convert_to_tensor=False).tolist()
-    embedding_time = time.time() - embedding_start
-    print("embedding time: {:.2f} ms".format(embedding_time * 1000))
-    return text_vector
 
 
 
